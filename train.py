@@ -23,7 +23,8 @@ sys.path.append(str(wd))
 from sentencepiece import SentencePieceProcessor
 
 #from model import Transformer
-from model_talking_train import Transformer, ModelArgs, apply_activation_checkpointing
+#from model_talking_train import Transformer, ModelArgs 
+from dcformer import DCFormerLlama,ModelArgs 
 from tp import maybe_init_dist
 
 
@@ -44,6 +45,14 @@ def timed(fn):
     torch.cuda.synchronize()
     return result, start.elapsed_time(end) / 1000
     #return result, time.time()-t0 
+
+######################### inference
+# Llama 7B 95.24 token/sec
+# Lllam 13B 51.74 token/sec
+
+# Llama talking 7B 88.34 token/sec, 1.078
+# Lllam talking 13B 46.72(48.5)  token/sec 1.067
+
 
 ########################## Llama 7B
 # no window and query_chunk
@@ -85,25 +94,25 @@ def timed(fn):
 
 
 ############################# Llama13B
-# llama compile L=40   0.9324 (4.5min, no checkpointing, with window and query_chunk_size=512)
-# llama talking compile L=40  (min, no checkpointing, with window and query_chunk_size=128, no constant_folding)   
+# llama compile L=40   0.9324 (4.5min, 74G, no checkpointing, with window and query_chunk_size=512)
+# llama talking compile L=40  (min, no checkpointing, with window and query_chunk_size=256, no constant_folding)   
+# llama talking compile L=40 OOM (min, no checkpointing, with window and query_chunk_size=128, no constant_folding)   
 
 def main():
     N_ITERS = 100
     VS = 50257
-    device = torch.device('cuda:0')
+    device = torch.device('cuda:1')
     max_seq_length = 2048 // 1
     dtype = torch.float16
     B, T, S, N, D, I = 1, 2048 // 1, 2048 // 1, 32, 128, 2; E = D * N; #L=32 // 8 # 6.7B
-    #config = ModelArgs(n_layer=32,n_head=32,dim=4096,block_size=max_seq_length) # 6.7B
-    config = ModelArgs(n_layer=40,n_head=40,dim=5120,block_size=max_seq_length) # 13B
+    config = ModelArgs(n_layer=32,n_head=32,dim=4096,block_size=max_seq_length, use_gradient_checkpointing=True, is_training=True, q_chunk_size=128,use_dcmha=True,vocab_size=VS) # 6.7B
+    #config = ModelArgs(n_layer=40,n_head=40,dim=5120,block_size=max_seq_length) # 13B
     #config.n_layer = 2 
-    model = Transformer(config)
+    
+    #model = Transformer(config)
+    model = DCFormerLlama(config)
     model = model.to(device=device, dtype=dtype)
     model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-    for layer in model.layers:
-        if hasattr(layer.attention, 'dyn_w_proj'):
-            layer.attention.dyn_w_proj.merge_weights()
 
     #opt = torch.optim.Adam(model.parameters())
     opt = None

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch._dynamo.config
 import torch._inductor.config
 
@@ -24,8 +25,8 @@ sys.path.append(str(wd))
 
 from sentencepiece import SentencePieceProcessor
 
-#from model import Transformer
-from model_talking import Transformer
+from model import Transformer
+from dcformer import DCFormerLlama
 from tp import maybe_init_dist
 
 
@@ -48,18 +49,18 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
+def prefill(model: nn.Module, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+def decode_one_token(model: nn.Module, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: nn.Module, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
@@ -78,8 +79,8 @@ def model_forward(model, x, input_pos):
     return model(x, input_pos)
 
 def speculative_decode(
-    model: Transformer,
-    draft_model: Transformer,
+    model: nn.Module,
+    draft_model: nn.Module,
     cur_token: torch.Tensor,
     input_pos: int,
     speculate_k: int,
@@ -129,12 +130,12 @@ def speculative_decode(
 
 @torch.no_grad()
 def generate(
-    model: Transformer,
+    model: nn.Module,
     prompt: torch.Tensor,
     max_new_tokens: int,
     *,
     interactive: bool,
-    draft_model: Transformer,
+    draft_model: nn.Module,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
     **sampling_kwargs
@@ -204,27 +205,29 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=None):
     #with torch.device('meta'):
-    model = Transformer.from_name(checkpoint_path.parent.name)
+    if model_size_str is None: 
+        model_size_str = checkpoint_path.parent.name
+    model = model_cls.from_name(model_size_str)
+    if checkpoint_path is not None:
+        if "int8" in str(checkpoint_path):
+            print("Using int8 weight-only quantization!")
+            from quantize import WeightOnlyInt8QuantHandler
+            simple_quantizer = WeightOnlyInt8QuantHandler(model)
+            model = simple_quantizer.convert_for_runtime()
 
-    if "int8" in str(checkpoint_path):
-        print("Using int8 weight-only quantization!")
-        from quantize import WeightOnlyInt8QuantHandler
-        simple_quantizer = WeightOnlyInt8QuantHandler(model)
-        model = simple_quantizer.convert_for_runtime()
+        if "int4" in str(checkpoint_path):
+            print("Using int4 quantization!")
+            path_comps = checkpoint_path.name.split(".")
+            assert path_comps[-2].startswith("g")
+            groupsize = int(path_comps[-2][1:])
+            from quantize import WeightOnlyInt4QuantHandler
+            simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
+            model = simple_quantizer.convert_for_runtime()
 
-    if "int4" in str(checkpoint_path):
-        print("Using int4 quantization!")
-        path_comps = checkpoint_path.name.split(".")
-        assert path_comps[-2].startswith("g")
-        groupsize = int(path_comps[-2][1:])
-        from quantize import WeightOnlyInt4QuantHandler
-        simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
-        model = simple_quantizer.convert_for_runtime()
-
-    checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
-    model.load_state_dict(checkpoint, assign=True, strict=False)
+        checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
+        model.load_state_dict(checkpoint, assign=True, strict=False)
 
     if use_tp:
         from tp import apply_tp
@@ -232,17 +235,12 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         apply_tp(model)
 
     model = model.to(device=device, dtype=precision)
-    #for n, p in model.named_parameters():
-    #    print(n,p.device, p.dtype)
-
-    for layer in model.layers:
-        if hasattr(layer.attention, 'dyn_w_proj'):
-            layer.attention.dyn_w_proj.merge_weights()
     return model.eval()
 
 B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
+    model_name: str = "DCFormerLlama",
     prompt: str = "Hello, my name is",
     interactive: bool = False,
     num_samples: int = 5,
@@ -255,6 +253,7 @@ def main(
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
+    model_size_str: str = "7B",
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -279,10 +278,18 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
+    if model_name == "DCFormerLlama":
+        model_cls = DCFormerLlama
+    elif model_name == "Llama":
+        model_cls = Transformer
+
+    #if model_size_str not in checkpoint_path.name:
+    checkpoint_path = None
+
+    model = _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=model_size_str)
 
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(model_cls, draft_checkpoint_path, device, precision, use_tp)
     else:
         draft_model = None
 
@@ -397,6 +404,8 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
+    parser.add_argument('--model_name', type=str, default="DCFormerLlama", help='Model name: Llama or DCFormerLlama')
+    parser.add_argument('--model_size', type=str, default="7B", help='Model size: 7B, 13B')
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
@@ -412,6 +421,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k
+        args.model_name, args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size
     )
