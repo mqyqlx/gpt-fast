@@ -45,7 +45,7 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     return probs
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[0, -1], temperature, top_k)
+    probs = logits_to_probs(logits[:, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
@@ -68,10 +68,10 @@ def decode_n_tokens(model: nn.Module, cur_token: torch.Tensor, input_pos: torch.
                 model, cur_token, input_pos, **sampling_kwargs
             )
         input_pos += 1
-        new_tokens.append(next_token.clone())
+        new_tokens.append(next_token.view(-1, 1).clone())
         callback(new_tokens[-1])
         new_probs.append(next_prob.clone())
-        cur_token = next_token.view(1, -1)
+        cur_token = next_token.view(-1, 1)
     return new_tokens, new_probs
 
 
@@ -138,6 +138,7 @@ def generate(
     draft_model: nn.Module,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
+    max_batch_size=1,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -146,32 +147,43 @@ def generate(
 
     is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
-    T = prompt.size(0)
+    T = prompt.size(1)
     T_new = T + max_new_tokens
     if interactive:
         max_seq_length = 350
     else:
         max_seq_length = min(T_new, model.config.block_size)
+        #max_seq_length = model.config.block_size
+
 
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt
+    empty = torch.empty((max_batch_size, T_new), dtype=dtype, device=device)
+    empty[:,:T] = prompt
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    
+    print('prefill input_pos', input_pos.shape)
+    next_token = prefill(model, prompt.view(max_batch_size, -1), input_pos, **sampling_kwargs)
     if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
+        prefill(draft_model, prompt.view(max_batch_size, -1), input_pos, **sampling_kwargs)
 
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    torch.cuda.synchronize()
+    prefill_dt = time.perf_counter() - t0
+    t0 = time.perf_counter()
+
+    seq[:, T] = next_token[:,0]
+
+    input_pos = torch.tensor([T] , device=device, dtype=torch.int) # max_batch_size.unsqueeze(1)
     accept_counts = [0] * (speculate_k + 1)
 
     if is_speculative:
@@ -191,13 +203,13 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+        generated_tokens, _ = decode_n_tokens(model, next_token.view(max_batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        seq[:,T + 1:] = torch.cat(generated_tokens, dim=-1)
 
     generate_stats = {
         'accept_counts': accept_counts
     }
-    return seq, generate_stats
+    return seq, generate_stats, prefill_dt, t0
 
 def encode_tokens(tokenizer, string, bos=True, device='cuda'):
     tokens = tokenizer.encode(string)
@@ -206,7 +218,6 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
 def _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=None):
-    #with torch.device('meta'):
     if model_size_str is None: 
         model_size_str = checkpoint_path.parent.name
     model = model_cls.from_name(model_size_str)
@@ -254,6 +265,8 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     model_size_str: str = "7B",
+    fake_prompt: bool = False,
+    max_batch_size: int = 1,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -296,11 +309,15 @@ def main(
     torch.cuda.synchronize()
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
+    torch.manual_seed(1234)
     tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    prompt_length = encoded.size(0)
+    if fake_prompt:
+        encoded = torch.randint(10000,(max_batch_size, 1024), device=device)
+        #encoded = torch.randint(10000,(max_batch_size, 5), device=device)
+        prompt = tokenizer.decode(encoded[0].tolist())
+    prompt_length = encoded.size(1)
 
-    torch.manual_seed(1234)
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
     if compile:
         if is_speculative and use_tp:
@@ -349,7 +366,7 @@ def main(
                 # print(, end='', flush=True)
         else:
             callback = lambda x : x
-        t0 = time.perf_counter()
+        #t0 = time.perf_counter()
         import contextlib
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
             prof = contextlib.nullcontext()
@@ -357,11 +374,12 @@ def main(
             torch.profiler._utils._init_for_cuda_graphs()
             prof = torch.profiler.profile()
         with prof:
-            y, metrics = generate(
+            y, metrics, prefill_dt, t0 = generate(
                 model,
                 encoded,
                 max_new_tokens,
                 draft_model=draft_model,
+                max_batch_size=max_batch_size,
                 speculate_k=speculate_k,
                 interactive=interactive,
                 callback=callback,
@@ -378,15 +396,16 @@ def main(
             else:
                 prof.export_chrome_trace(f"{profile}.json")
         torch.cuda.synchronize()
-        t = time.perf_counter() - t0
+        t = time.perf_counter() - t0 #- prefill_dt
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            print(tokenizer.decode(y[0].tolist()))
         else:
             print()
-        tokens_generated = y.size(0) - prompt_length
+        tokens_generated = (y.size(1) - prompt_length - 1) * max_batch_size
         tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
+        print(f"Time for prefill inference {i + 1}: {prefill_dt:.05f} sec")
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
         print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
     print("==========")
@@ -407,9 +426,11 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default="DCFormerLlama", help='Model name: Llama or DCFormerLlama')
     parser.add_argument('--model_size', type=str, default="7B", help='Model size: 7B, 13B')
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    parser.add_argument('--fake_prompt', action='store_true', help='Whether to evaluate inference performance using a fake prompt of 1024 tokens in length.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
+    parser.add_argument('--max_batch_size', type=int, default=1, help='Maximum number of batch')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
@@ -422,5 +443,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     main(
         args.model_name, args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size, args.fake_prompt, args.max_batch_size
     )

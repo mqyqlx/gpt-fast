@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import math
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -51,9 +52,12 @@ class ModelArgs:
 
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
+    "1p4Ba": dict(n_layer=24, n_head=16, dim=2048),
+    "1p4Bb": dict(n_layer=24, n_head=32, dim=2048),
+    "2p8B": dict(n_layer=32, n_head=32, dim=2560),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
-    "30B": dict(n_layer=60, n_head=52, dim=6656),
+    "33B": dict(n_layer=60, n_head=52, dim=6656),
     "34B": dict(n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_heads=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
     "70B": dict(n_layer=80, n_head=64, dim=8192, n_local_heads=8, intermediate_size=28672),
 }
@@ -148,6 +152,7 @@ class Attention(nn.Module):
 
         self.n_head = config.n_head
         self.head_dim = config.head_dim
+        self.scale_factor = 1 / math.sqrt(self.head_dim)
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self._register_load_state_dict_pre_hook(self.load_hook)
@@ -179,7 +184,14 @@ class Attention(nn.Module):
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        logits = q @ k.transpose(-2, -1) * self.scale_factor 
+        min_value = torch.finfo(torch.float16).min
+        logits = torch.where(mask, logits, min_value)
+        probs = logits.softmax(-1)
+        y = probs @ v
+
+        #y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -225,7 +237,7 @@ def precompute_freqs_cis(
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    freqs_cis = freqs_cis.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
