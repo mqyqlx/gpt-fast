@@ -139,6 +139,7 @@ def generate(
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
     max_batch_size=1,
+    full_cache=False,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -149,12 +150,12 @@ def generate(
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(1)
     T_new = T + max_new_tokens
-    if interactive:
+    if full_cache:
+        max_seq_length = model.config.block_size
+    elif interactive:
         max_seq_length = 350
     else:
         max_seq_length = min(T_new, model.config.block_size)
-        #max_seq_length = model.config.block_size
-
 
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
@@ -172,7 +173,6 @@ def generate(
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     
-    print('prefill input_pos', input_pos.shape)
     next_token = prefill(model, prompt.view(max_batch_size, -1), input_pos, **sampling_kwargs)
     if is_speculative:
         prefill(draft_model, prompt.view(max_batch_size, -1), input_pos, **sampling_kwargs)
@@ -217,10 +217,11 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=None):
+def _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=None, window_size=None):
     if model_size_str is None: 
         model_size_str = checkpoint_path.parent.name
-    model = model_cls.from_name(model_size_str)
+    kwargs=dict(window_size=window_size)
+    model = model_cls.from_name(model_size_str, **kwargs)
     if checkpoint_path is not None:
         if "int8" in str(checkpoint_path):
             print("Using int8 weight-only quantization!")
@@ -267,15 +268,18 @@ def main(
     model_size_str: str = "7B",
     fake_prompt: bool = False,
     max_batch_size: int = 1,
+    full_cache: bool = False,
+    window_size: Optional[int] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
-    assert checkpoint_path.is_file(), checkpoint_path
+    global print
+    if not checkpoint_path.is_file():
+        print('Use untrained model for non-exist model path.')
 
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     assert tokenizer_path.is_file(), tokenizer_path
 
-    global print
     rank = maybe_init_dist()
     use_tp = rank is not None
     if use_tp:
@@ -296,10 +300,9 @@ def main(
     elif model_name == "Llama":
         model_cls = Transformer
 
-    #if model_size_str not in checkpoint_path.name:
     checkpoint_path = None
 
-    model = _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=model_size_str)
+    model = _load_model(model_cls, checkpoint_path, device, precision, use_tp, window_size=window_size, model_size_str=model_size_str)
 
     if is_speculative:
         draft_model = _load_model(model_cls, draft_checkpoint_path, device, precision, use_tp)
@@ -314,7 +317,6 @@ def main(
     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
     if fake_prompt:
         encoded = torch.randint(10000,(max_batch_size, 1024), device=device)
-        #encoded = torch.randint(10000,(max_batch_size, 5), device=device)
         prompt = tokenizer.decode(encoded[0].tolist())
     prompt_length = encoded.size(1)
 
@@ -366,7 +368,6 @@ def main(
                 # print(, end='', flush=True)
         else:
             callback = lambda x : x
-        #t0 = time.perf_counter()
         import contextlib
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
             prof = contextlib.nullcontext()
@@ -380,6 +381,7 @@ def main(
                 max_new_tokens,
                 draft_model=draft_model,
                 max_batch_size=max_batch_size,
+                full_cache=full_cache,
                 speculate_k=speculate_k,
                 interactive=interactive,
                 callback=callback,
@@ -433,15 +435,17 @@ if __name__ == '__main__':
     parser.add_argument('--max_batch_size', type=int, default=1, help='Maximum number of batch')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--checkpoint_path', type=Path, default=Path("data/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
+    parser.add_argument('--full_cache', action='store_true', help='Whether to use kv cache with max sequence length.')
+    parser.add_argument('--window_size', type=int, default=None, help='Window size of attention block in alternating layers')
 
     args = parser.parse_args()
     main(
         args.model_name, args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size, args.fake_prompt, args.max_batch_size
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size, args.fake_prompt, args.max_batch_size, args.full_cache,args.window_size
     )
