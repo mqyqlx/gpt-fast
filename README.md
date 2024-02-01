@@ -1,3 +1,20 @@
+# DCFormer Inference Speed Benchmark 
+
+This repository benchmarks the inference speed of DCFormer based on the official [gpt-fast](https://github.com/pytorch-labs/gpt-fast/tree/main) implementation.
+The main model is contained in `dcformer.py`.
+
+# Environment
+To set up the required environment, use the following command:
+```bash
+pip install -r requirements.txt
+```
+# Reproducing Results
+To reproduce our benchmark results, refer to `eval_inference.sh`, or execute the following command:
+
+```bash
+python -u generate.py --compile --fake_prompt --model_name DCFormerLlama --max_new_tokens 128 --num_samples 3 --temperature 0.5 --model_size 7B --window_size 256
+```  
+
 # gpt-fast
 Simple and efficient pytorch-native transformer text generation.
 
