@@ -135,7 +135,7 @@ class DCFormerLlama(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+    def setup_caches(self, max_batch_size, max_seq_length, set_kv_cache=True):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -144,10 +144,12 @@ class DCFormerLlama(nn.Module):
         self.max_batch_size = max_batch_size
         if not self.is_training:
             for b in self.layers:
-                b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, window_size=b.attention.window_size)
+                if set_kv_cache:
+                    b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, window_size=b.attention.window_size)
+                b.attention.dyn_w_proj.merge_weights()
                 if not b.attention.use_sw:
-                    device = b.attention.kv_cache.k_cache.device
                     dtype = b.attention.wo.weight.dtype
+                    device = b.attention.wo.weight.device
                     b.attention.dyn_w_proj.sw = b.attention.dyn_w_proj.sw.to(device=device, dtype=dtype)
                     b.attention.dyn_w_proj.pre_proj.w = b.attention.dyn_w_proj.pre_proj.w.to(device=device, dtype=dtype) 
                     b.attention.dyn_w_proj.post_proj.w = b.attention.dyn_w_proj.post_proj.w.to(device=device, dtype=dtype) 
@@ -163,11 +165,13 @@ class DCFormerLlama(nn.Module):
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
+        if input_pos is None:
+            input_pos = torch.arange(idx.shape[-1], device=idx.device, dtype=torch.int)
         if self.window_size is None or self.is_training:
             mask = self.causal_mask[None, None, input_pos]
         else:
             mask = self.causal_mask[None, None,:,input_pos]
-        freqs_cis = self.freqs_cis[input_pos]
+        freqs_cis = self.freqs_cis[input_pos][:idx.shape[-1]]
         x = self.tok_embeddings(idx)
         for i, layer in enumerate(self.layers):
             layer_mask = mask if self.is_training or self.window_size is None else mask[:,:,i%2]
@@ -579,8 +583,11 @@ def precompute_freqs_cis(
 def unbind(ary, n, dim=0):
     return [torch.squeeze(a, dim=dim) for a in torch.split(ary, ary.shape[dim] // n, dim=dim)]
 
-def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+def apply_rotary_emb(x: Tensor, freqs_cis: Tensor, mode='half') -> Tensor:
+    if mode == 'half':
+        xshaped = x.float().reshape(*x.shape[:-1], 2,-1).transpose(-1,-2) 
+    elif mode == 'alternative':
+        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
     freqs_cis = freqs_cis.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
@@ -592,3 +599,59 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
 
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
+
+def match_weight(model, w):
+    map_dict={'q_proj':'query', 'k_proj':'key', 'v_proj':'value','wo':'post', 'w1': 'ffn_layer1_gate', 'w3': 'ffn_layer1', 'w2': 'ffn_layer2',
+              'weight': 'w'} # 'pre_proj': 'pre_proj', 'post_proj': 'post_proj'
+    _, E, H, D = w['state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_0.self_attention.key.w'].shape # (16, 2560, 32, 80)
+    N = w['state.mdl_vars.params.lm.embedding_lookup.emb_var'].shape[0] #50304
+    state_dict = {}
+    for k, v in model.named_parameters():
+        if k == 'tok_embeddings.weight':
+            v = w['state.mdl_vars.params.lm.embedding_lookup.emb_var']#[:50257,:]
+        elif k == 'norm.weight':
+            v = w['state.mdl_vars.params.lm.final_ln.scale']
+        elif k == 'output.weight':
+            v = w['state.mdl_vars.params.lm.softmax.logits_ffn.linear.w'].T#[:50257,:]  # E,N -> N,E
+        else:
+            layer = int(k.split('.')[1])
+            sub_layer, _layer = layer % 2, layer //2 # sub_layer 0/1, _layer 0-15
+            if '.attention.' in k:
+                if k.endswith('_m'):continue # merged proj weights
+                _, _, _, ptype, wtype = k.split('.')
+                if k.endswith('_p'): continue # ablation parameters
+                if ptype in ['dyn_w_proj']: # pre post proj
+                    v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.{map_dict.get(ptype, ptype)}.{map_dict.get(wtype, wtype)}'][_layer]
+                elif ptype in ['q_norm', 'k_norm']:
+                    v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.{map_dict.get(ptype, ptype)}.{map_dict.get(wtype, wtype)}'][_layer]
+                elif ptype == 'wqkv':
+                    _q = torch.tensor(w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.query.w'][_layer]).reshape(E,E) # EHD->EE
+                    _k = torch.tensor(w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.key.w'][_layer]).reshape(E,E) # EHD->EE
+                    _v = torch.tensor(w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.value.w'][_layer]).reshape(E,E) # EHD->EE
+                    v = torch.cat([_q, _k, _v],dim=-1).T
+                else: # o
+                    v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.{map_dict.get(ptype, ptype)}.{map_dict.get(wtype, wtype)}'][_layer].reshape(E,H*D)
+            elif 'feed_forward' in k:
+                ptype = k.split('.')[3] # w1, w3,w2
+                v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.ff_layer.{map_dict[ptype]}.linear.w'][_layer].T
+            elif 'ffn_norm' in k: # mlp layernorm
+                v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.ff_layer.layer_norm.scale'][_layer]
+            elif 'attention_norm' in k: # attention layernorm
+                v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.layer_norm.scale'][_layer]
+        state_dict[k] = torch.tensor(v)
+    model.load_state_dict(state_dict, strict=False)
+    return model
+
+if __name__ == '__main__':
+    model_path = ''
+    model_size_str = '2p8B'
+    device = 'cuda'
+    kwargs=dict(window_size=256,vocab_size=50257,use_qk_norm=True,norm_eps=1e-6)
+    model = DCFormerLlama.from_name(model_size_str, **kwargs)
+    w = torch.load(model_path)
+    model = match_weight(model,w)
+    _ = model.eval()
+    _ = model.half()
+    _ = model.to(device)
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_length=2048,set_kv_cache=False)
