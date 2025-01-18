@@ -1,2 +1,3 @@
-torch
-sentencepiece
+sentencepiece==0.1.99
+einops
+transformers==4.35.0

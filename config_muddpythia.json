@@ -1,0 +1,31 @@
+{
+  "architectures": [
+    "MUDDPythia"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_muddpythia.MUDDythiaConfig",
+    "AutoModelForCausalLM": "modeling_muddpythia.MUDDPythia"
+  },
+  "block_size": 2048,
+  "bos_token_id": 0,
+  "dim": 4096,
+  "eos_token_id": 0,
+  "head_dim": 128,
+  "intermediate_size": 16384,
+  "is_training": false,
+  "model_type": "muddpythia",
+  "n_head": 32,
+  "n_layer": 32,
+  "n_local_heads": 32,
+  "norm_eps": 1e-05,
+  "rope_base": 10000,
+  "rotary_pct": 0.25,
+  "tie_word_embeddings": false,
+  "torch_dtype": "float16",
+  "transformers_version": "4.33.2",
+  "use_gradient_checkpointing": false,
+  "use_linear_bias": true,
+  "use_parallel_residual": true,
+  "vocab_size": 50432,
+  "window_type": null
+}

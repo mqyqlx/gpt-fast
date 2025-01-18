@@ -37,6 +37,8 @@ class ModelArgs:
     use_dcmha: bool = True
     use_qk_norm: bool = False 
     window_size: Optional[int] = 256
+    window_type: Optional[str] = None
+    query_wise: bool = False
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -72,12 +74,13 @@ transformer_configs = {
 }
 
 class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, window_size=2048, dtype=torch.float16):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, window_size=2048, dtype=torch.float16, use_kw_cache=True):
         super().__init__()
         self.head_dim = head_dim
         self.kw_dim = 2 * n_heads 
         self.n_heads = n_heads
         self.window_size = window_size
+        self.use_kw_cache = use_kw_cache 
 
         if window_size is None:
             self.seq_length = max_seq_length
@@ -87,33 +90,44 @@ class KVCache(nn.Module):
         kw_cache_shape = (max_batch_size, self.seq_length, 2, n_heads, n_heads)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('kw_cache', torch.zeros(kw_cache_shape, dtype=dtype))
+        if self.use_kw_cache:
+            self.register_buffer('kw_cache', torch.zeros(kw_cache_shape, dtype=dtype))
 
     def update(self, input_pos, k_val, v_val, kw_val=None): # kw_val B,N,S,2,N      B2NSD
         # input_pos: [S], k_val: [B, H, S, D]
+        # print('input pos in cache', input_pos.shape)
         assert input_pos.shape[-1] == k_val.shape[2]
         B,N,S,D = v_val.shape
         k_out = self.k_cache
         v_out = self.v_cache
-        kw_out = self.kw_cache
+        if self.use_kw_cache:
+            kw_out = self.kw_cache
+        else:
+            kw_out = None
 
         if self.window_size is None:
             k_out[:, :, input_pos] = k_val
             v_out[:, :, input_pos] = v_val
-            if kw_val is not None:
+            if self.use_kw_cache and kw_val is not None:
                 kw_out[:,input_pos] = kw_val
         elif S==1:
             input_pos = input_pos % self.seq_length
-            v_out[:, :, input_pos] = v_val[:,:,0]
-            k_out[:, :, input_pos] = k_val[:,:,0]
-            if kw_val is not None:
-                kw_out[:,input_pos] = kw_val[:,0]
+            # print(input_pos, v_out[:, :, input_pos].shape, v_val[:,:,0].shape)
+            # input_pos = input_pos[0]
+            v_out[:, :, input_pos] = v_val[:,:]
+            k_out[:, :, input_pos] = k_val[:,:]
+            if self.use_kw_cache and kw_val is not None:
+                kw_out[:,input_pos] = kw_val[:]
+            # v_out[:, :, input_pos] = v_val[:,:,0]
+            # k_out[:, :, input_pos] = k_val[:,:,0]
+            # if self.use_kw_cache and kw_val is not None:
+            #     kw_out[:,input_pos] = kw_val[:,0]
         else: # prefill
             start = max(0,-self.seq_length)
             input_pos = input_pos[start:] % self.seq_length
             v_out[:, :, input_pos] = v_val[:,:,start:]
             k_out[:, :, input_pos] = k_val[:,:,start:]
-            if kw_val is not None:
+            if self.use_kw_cache and kw_val is not None:
                 kw_out[:, input_pos] = kw_val[:,start:]
         return k_out, v_out, kw_out 
 
@@ -132,6 +146,7 @@ class DCFormerLlama(nn.Module):
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
         self.window_size = config.window_size
+        #self.window_type = config.window_type
         self.max_batch_size = -1
         self.max_seq_length = -1
 
@@ -145,7 +160,8 @@ class DCFormerLlama(nn.Module):
         if not self.is_training:
             for b in self.layers:
                 if set_kv_cache:
-                    b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, window_size=b.attention.window_size)
+                    use_kw_cache = False if b.attention.query_wise else True
+                    b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, window_size=b.attention.window_size, use_kw_cache=use_kw_cache)
                 b.attention.dyn_w_proj.merge_weights()
                 if not b.attention.use_sw:
                     dtype = b.attention.wo.weight.dtype
@@ -161,12 +177,15 @@ class DCFormerLlama(nn.Module):
         elif self.window_size is None:
             self.causal_mask = torch.tril(torch.ones(max_seq_length, max_seq_length, dtype=torch.bool, device=self.tok_embeddings.weight.device))
         else:
-            self.causal_mask = torch.stack([make_window_mask(max_seq_length, self.config.window_size), torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))])
+            self.causal_mask = torch.stack([make_window_mask(max_seq_length, self.config.window_size), torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))]) # LG
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         if input_pos is None:
             input_pos = torch.arange(idx.shape[-1], device=idx.device, dtype=torch.int)
+        # elif len(input_pos[0]) == 1:
+        #     input_pos = input_pos[0]
+        # print('input_pos forward', input_pos.shape)
         if self.window_size is None or self.is_training:
             mask = self.causal_mask[None, None, input_pos]
         else:
@@ -174,7 +193,11 @@ class DCFormerLlama(nn.Module):
         freqs_cis = self.freqs_cis[input_pos][:idx.shape[-1]]
         x = self.tok_embeddings(idx)
         for i, layer in enumerate(self.layers):
-            layer_mask = mask if self.is_training or self.window_size is None else mask[:,:,i%2]
+            #layer_mask = mask if self.is_training or self.window_size is None else mask[:,:,i%2]
+            if self.is_training or self.window_size is None :
+                layer_mask = mask
+            elif self.window_size is not None: 
+                layer_mask = mask[:,:,1] if layer.attention.window_size is None else mask[:,:,0]
             if self.use_gradient_checkpointing:
                 x = checkpoint(layer, x, input_pos, freqs_cis, layer_mask)
             else:
@@ -383,7 +406,20 @@ class DCMHAttention(nn.Module):
             self.q_norm = RMSnorm(hid_dim=self.head_dim)
             self.k_norm = RMSnorm(hid_dim=self.head_dim)
 
-        self.window_size = None if self.lidx % 2 == 1 else config.window_size 
+        self.window_types = {
+            "LG":[256, None],
+            "LGLL":[256, None, 256, 256],
+            "LGL6":[256, None, 256, 256, 256, 256, 256, 256],
+        }
+
+        self.query_wise = config.query_wise
+        if config.window_type is None:
+            #self.window_size = None if self.lidx % 2 == 1 else config.window_size 
+            self.window_size = config.block_size if self.lidx % 2 == 1 else config.window_size 
+        else:
+            window_l = self.window_types[config.window_type]
+            self.window_size = window_l[self.lidx % len(window_l)] 
+
         if not self.is_training:
             self._register_load_state_dict_pre_hook(self.load_hook)
 
@@ -479,14 +515,22 @@ class DCMHAttention(nn.Module):
                 w1 = self.dyn_w_proj.dw1_norm(w1) # BT22IN
                 qkdd = self.dyn_w_proj.dw_activation(dd.view((B,T,2,2,N))) # BT2{2}N1->BT2{2}N tanh
                 qkw = torch.einsum('BTKJIN,BTKJIM->BTKJNM', w1, w2) + torch.diag_embed(qkdd) # j=k=2, BT2{2}NM q/k, pre/post
-                qw, kw_new = qkw.unbind(2) # BS2NM
-                kw_new = kw_new + self.dyn_w_proj.sw  # BS2NM + 2NM-> BS2NM 
+                if self.query_wise: # TODO: do not generate kw and kdd
+                    qw, _ = qkw.unbind(2) # BS2NM
+                    kw_new = None
+                    qw = qw + self.dyn_w_proj.sw 
+                else:
+                    qw, kw_new = qkw.unbind(2) # BS2NM
+                    kw_new = kw_new + self.dyn_w_proj.sw  # BS2NM + 2NM-> BS2NM 
                 if self.kv_cache is not None:
                     k, v, kw_out = self.kv_cache.update(input_pos, k, v, kw_val=kw_new) #BNT2M
                 logits = q @ k.transpose(-2, -1) * self.scale_factor 
-                w = qw + kw_out # BS2NM 
+                if self.query_wise:
+                    w = qw  # B12NM
+                else:
+                    w = qw + kw_out # BS2NM 
                 wl, w = w.permute(0,2,3,4,1).unbind(1)  # BS2NM->B2NMS->[BNMS]*2 
-                logits = (logits * wl).sum(1).unsqueeze(2)
+                logits = (logits * wl).sum(1).unsqueeze(2) # BN1S, BNMS -> BNMS-> BM1S 
                 min_value = torch.finfo(torch.float16).min
                 logits = torch.where(k_mask, logits, min_value)
                 probs = logits.softmax(-1)

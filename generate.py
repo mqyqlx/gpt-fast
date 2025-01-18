@@ -3,6 +3,11 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+
+#import os
+#os.environ['TRITON_CACHE_DIR'] = './triton_cache'
+#os.environ['TRITON_LOG_LEVEL'] = 'debug'
+import json
 import itertools
 import sys
 import time
@@ -14,9 +19,10 @@ import torch.nn as nn
 import torch._dynamo.config
 import torch._inductor.config
 
+torch._dynamo.config.cache_size_limit = 64
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
-#torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
+torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
 
 
 # support running without installing as a package
@@ -27,6 +33,8 @@ from sentencepiece import SentencePieceProcessor
 
 from model import Transformer
 from dcformer import DCFormerLlama
+from modeling_muddformer import MUDDFormer, MUDDFormerConfig
+from ddformer import DynamicDenseFormer, transformer_configs
 from tp import maybe_init_dist
 
 
@@ -140,6 +148,7 @@ def generate(
     callback = lambda x: x,
     max_batch_size=1,
     full_cache=False,
+    precision=torch.float16,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -160,9 +169,9 @@ def generate(
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length, dtype=precision)
         if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length)
+            draft_model.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length, dtype=precision)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty((max_batch_size, T_new), dtype=dtype, device=device)
@@ -217,11 +226,28 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(model_cls, checkpoint_path, device, precision, use_tp, model_size_str=None, window_size=None):
+def _load_model(model_cls, model_name, checkpoint_path, device, precision, use_tp, model_size_str=None, window_size=None, window_type=None, query_wise=False):
     if model_size_str is None: 
         model_size_str = checkpoint_path.parent.name
-    kwargs=dict(window_size=window_size)
-    model = model_cls.from_name(model_size_str, **kwargs)
+    kwargs=dict(window_size=window_size, window_type=window_type, query_wise=query_wise)
+
+    if model_cls is MUDDFormer: #
+        with open('config_muddformer.json', 'r') as f:
+            config = json.loads(f.read())
+        size_config = transformer_configs[model_size_str] 
+        config.update(size_config)
+        config['n_local_heads'] = config['n_head']
+        config['intermediate_size'] = None
+        config['vocab_size'] = 32000
+        # config['use_layer_cache'] = True
+        if model_name == 'DenseFormer':
+            config.update(dict(dense=True, dynamic_dense=False, sepln=False, dense_type='l'))
+        elif model_name == 'DDFormer':
+            config.update(dict(dense=True, dynamic_dense=True, sepln=False, dense_type='l'))
+        config= MUDDFormerConfig(**config)
+        model = MUDDFormer(config)
+    elif hasattr(model_cls, 'from_name'):
+        model = model_cls.from_name(model_size_str, **kwargs)
     if checkpoint_path is not None:
         if "int8" in str(checkpoint_path):
             print("Using int8 weight-only quantization!")
@@ -270,6 +296,8 @@ def main(
     max_batch_size: int = 1,
     full_cache: bool = False,
     window_size: Optional[int] = None,
+    window_type: Optional[str] = None,
+    query_wise: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -292,6 +320,7 @@ def main(
     precision = torch.float16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
+    if window_type == 'default': window_type = None
 
     print("Loading model ...")
     t0 = time.time()
@@ -299,13 +328,17 @@ def main(
         model_cls = DCFormerLlama
     elif model_name == "Llama":
         model_cls = Transformer
+    elif model_name == "DynamicDenseFormer":
+        model_cls = DynamicDenseFormer
+    elif model_name in ["MUDDFormer", "DDFormer", "DenseFormer"]:
+        model_cls = MUDDFormer
 
     checkpoint_path = None
 
-    model = _load_model(model_cls, checkpoint_path, device, precision, use_tp, window_size=window_size, model_size_str=model_size_str)
+    model = _load_model(model_cls, model_name, checkpoint_path, device, precision, use_tp, window_size=window_size,window_type=window_type, query_wise=query_wise, model_size_str=model_size_str)
 
     if is_speculative:
-        draft_model = _load_model(model_cls, draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(model_cls, model_name,  draft_checkpoint_path, device, precision, use_tp)
     else:
         draft_model = None
 
@@ -321,6 +354,7 @@ def main(
     prompt_length = encoded.size(1)
 
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
+    print('model_size:', model_size/1e9)
     if compile:
         if is_speculative and use_tp:
             torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
@@ -345,6 +379,7 @@ def main(
 
     for i in range(start, num_samples):
         torch.cuda.synchronize()
+        print(f'num_samples: {i}/{num_samples}')
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
             if is_chat:
@@ -374,6 +409,7 @@ def main(
         else:
             torch.profiler._utils._init_for_cuda_graphs()
             prof = torch.profiler.profile()
+            print('profiling...')
         with prof:
             y, metrics, prefill_dt, t0 = generate(
                 model,
@@ -387,12 +423,15 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                precision=precision,
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
+        print('forward done')
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
         if hasattr(prof, "export_chrome_trace"):
+            prof.step()
             if use_tp:
                 prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
             else:
@@ -401,6 +440,7 @@ def main(
         t = time.perf_counter() - t0 #- prefill_dt
 
         if not interactive:
+            print(y[0].shape, y[0].max())
             print(tokenizer.decode(y[0].tolist()))
         else:
             print()
@@ -443,9 +483,11 @@ if __name__ == '__main__':
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--full_cache', action='store_true', help='Whether to use kv cache with max sequence length.')
     parser.add_argument('--window_size', type=int, default=None, help='Window size of attention block in alternating layers')
+    parser.add_argument('--window_type', type=str, default='default', help='Window type, such as LG,LGLL') # local or global
+    parser.add_argument('--query_wise', action='store_true', help='Query-wise composition only')
 
     args = parser.parse_args()
     main(
         args.model_name, args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size, args.fake_prompt, args.max_batch_size, args.full_cache,args.window_size
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.model_size, args.fake_prompt, args.max_batch_size, args.full_cache,args.window_size, args.window_type,args.query_wise
     )

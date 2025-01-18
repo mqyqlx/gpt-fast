@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
+from collections import namedtuple
+
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -31,6 +33,8 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
     window_size: Optional[int] = None 
+    window_type: Optional[str] = None
+    query_wise: bool = False
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -55,6 +59,7 @@ class ModelArgs:
 
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
+    "0p4B": dict(n_layer=24, n_head=16, dim=1024),
     "1p4Ba": dict(n_layer=24, n_head=16, dim=2048),
     "1p4Bb": dict(n_layer=24, n_head=32, dim=2048),
     "2p8B": dict(n_layer=32, n_head=32, dim=2560),
@@ -107,6 +112,7 @@ class Transformer(nn.Module):
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.layers = nn.ModuleList(TransformerBlock(config, lidx) for lidx in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.norm_noscale = RMSnormNoscale(epsilon=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         self.freqs_cis: Optional[Tensor] = None
@@ -115,7 +121,15 @@ class Transformer(nn.Module):
         self.max_batch_size = -1
         self.max_seq_length = -1
 
-    def setup_caches(self, max_batch_size, max_seq_length):
+        self.dense_coeff = None
+
+    def init_dense_coeff(self):
+        self.dense_coeff = nn.ParameterList([nn.Parameter(data=torch.randn(1)) for lidx in range(self.config.n_layer)])
+        # self.dense_coeff = nn.ParameterList([nn.Parameter(data=torch.tensor([0]* (lidx+1) + [1]).bfloat16()) for lidx in range(self.config.n_layer)])
+
+
+
+    def setup_caches(self, max_batch_size, max_seq_length,dtype=torch.float16):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
         head_dim = self.config.dim // self.config.n_head
@@ -123,7 +137,7 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, window_size=b.attention.window_size)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, window_size=b.attention.window_size, dtype=dtype)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         if self.window_size is None:
@@ -131,21 +145,36 @@ class Transformer(nn.Module):
         else:
             self.causal_mask = torch.stack([make_window_mask(max_seq_length, self.config.window_size), torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))])
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, return_tensor=True) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
+        if input_pos is None:
+            input_pos = torch.arange(idx.shape[-1], device=idx.device, dtype=torch.int)
         if self.window_size is None:
             mask = self.causal_mask[None, None, input_pos]
         else:
             mask = self.causal_mask[None, None,:,input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
-
+        hiddens = [x]
+        attn_probs = []
         for i, layer in enumerate(self.layers):
-            layer_mask = mask if self.window_size is None else mask[:,:,i%2]
-            x = layer(x, input_pos, freqs_cis, layer_mask)
+            #layer_mask = mask if self.window_size is None else mask[:,:,i%2]
+            if self.window_size is None:
+                layer_mask = mask
+            elif self.window_size is not None: 
+                layer_mask = mask[:,:,1] if layer.attention.window_size is None else mask[:,:,0]
+            x, probs = layer(x, input_pos, freqs_cis, layer_mask)
+            attn_probs.append(probs)
+            hiddens.append(x)
+            if self.dense_coeff is not None: x = x * self.dense_coeff[i]  # x_out = (x_out -x_in) * c + x_in
+            # if self.dense_coeff is not None: x = sum([self.norm_noscale(hiddens[j]) * self.dense_coeff[i][j] for j in range(i+2)]) # LBTD, L -> BTD
         x = self.norm(x)
         logits = self.output(x)
-        return logits
+        if return_tensor:
+            return logits
+        else:
+            CausalLMOutput = namedtuple("CausalLMOutput", ["logits", "hiddens", "attn_probs"])
+            return CausalLMOutput(logits=logits, hiddens=hiddens, attn_probs=attn_probs)     
 
     @classmethod
     def from_name(cls, name: str, **kwargs):
@@ -162,9 +191,10 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        attn_out = self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = x + attn_out[0]
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        return out, attn_out[1]
 
 
 class Attention(nn.Module):
@@ -184,7 +214,17 @@ class Attention(nn.Module):
         self.scale_factor = 1 / math.sqrt(self.head_dim)
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
-        self.window_size = None if self.lidx % 2 == 1 else config.window_size 
+        self.window_types = {
+            "LG":[256, None],
+            "LGLL":[256, None, 256, 256],
+            "LGL6":[256, None, 256, 256, 256, 256, 256, 256],
+        }
+        # self.window_size = None #if self.lidx % 2 == 1 else config.window_size 
+        if config.window_type is None:
+            self.window_size = None if self.lidx % 2 == 1 else config.window_size 
+        else:
+            window_l = self.window_types[config.window_type]
+            self.window_size = window_l[self.lidx % len(window_l)] 
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -204,17 +244,22 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
+        # print(q.shape, freqs_cis.shape)
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
 
-        if self.window_size is None:
-            k_mask = mask
-        elif seqlen == 1: # one-token generation
+        if self.kv_cache is not None:
+            if seqlen == 1:
+                k, v = self.kv_cache.update(input_pos, k, v)
+            else:
+                _, _ = self.kv_cache.update(input_pos, k, v)
+
+        # if self.window_size is None:
+        #     k_mask = mask
+        if seqlen == 1: # one-token generation
             k_mask = mask[:,:,:,:self.kv_cache.seq_length]
         else:# prefill
             k_mask = mask[:,:,:,:k.shape[-2]] 
@@ -228,7 +273,8 @@ class Attention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
         y = self.wo(y)
-        return y
+        # probs = None
+        return y, probs
 
 
 class FeedForward(nn.Module):
@@ -274,8 +320,25 @@ def precompute_freqs_cis(
     return cache.to(dtype=torch.float16)
 
 
-def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+class RMSnormNoscale(nn.Module):
+    
+    def __init__(self, epsilon=1e-6, dim=-1):
+        super().__init__()
+        self.dim = dim 
+        self.epsilon = epsilon
+
+    def forward(self, inputs):
+        var = inputs.pow(2).mean(dim=self.dim, keepdim=True)
+        normed_inputs = inputs * torch.rsqrt(var + self.epsilon)
+        return normed_inputs 
+
+
+
+def apply_rotary_emb(x: Tensor, freqs_cis: Tensor, mode='half') -> Tensor:
+    if mode == 'half':
+        xshaped = x.float().reshape(*x.shape[:-1], 2,-1).transpose(-1,-2) 
+    elif mode == 'alternative':
+        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
     freqs_cis = freqs_cis.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
@@ -287,3 +350,40 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
 
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
+
+
+def match_weight_llama(model, w):
+    map_dict={'q_proj':'query', 'k_proj':'key', 'v_proj':'value','wo':'post', 'w1': 'ffn_layer1_gate', 'w3': 'ffn_layer1', 'w2': 'ffn_layer2',
+              'weight': 'w'} # 'pre_proj': 'pre_proj', 'post_proj': 'post_proj'
+    E, H, D = model.config.dim, model.config.n_head, model.config.head_dim
+    N = model.config.vocab_size
+    state_dict = {}
+    for k, v in model.named_parameters():
+        if k == 'tok_embeddings.weight':
+            v = w['state.mdl_vars.params.lm.embedding_lookup.emb_var']#[:50257,:]
+        elif k == 'norm.weight':
+            v = w['state.mdl_vars.params.lm.final_ln.scale']
+        elif k == 'output.weight':
+            v = w['state.mdl_vars.params.lm.softmax.logits_ffn.linear.w'].T#[:50257,:]  # E,N -> N,E
+        else:
+            layer = int(k.split('.')[1])
+            sub_layer, _layer = 0, layer
+            if '.attention.' in k:
+                _, _, _, ptype, wtype = k.split('.')
+                if ptype == 'wqkv':
+                    _q = torch.tensor(w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.query.w'][_layer]).reshape(E,E) # EHD->EE
+                    _k = torch.tensor(w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.key.w'][_layer]).reshape(E,E) # EHD->EE
+                    _v = torch.tensor(w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.value.w'][_layer]).reshape(E,E) # EHD->EE
+                    v = torch.cat([_q, _k, _v],dim=-1).T
+                else: # o
+                    v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.self_attention.{map_dict.get(ptype, ptype)}.{map_dict.get(wtype, wtype)}'][_layer].reshape(E,H*D)
+            elif 'feed_forward' in k:
+                ptype = k.split('.')[3] # w1, w3,w2
+                v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.ff_layer.{map_dict[ptype]}.linear.w'][_layer].T
+            elif 'ffn_norm' in k: # mlp layernorm
+                v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.ff_layer.layer_norm.scale'][_layer]
+            elif 'attention_norm' in k: # attention layernorm
+                v = w[f'state.mdl_vars.params.lm.transformer.repeat.sub.x_layers_{sub_layer}.layer_norm.scale'][_layer]
+        state_dict[k] = torch.tensor(v)
+    model.load_state_dict(state_dict, strict=False)
+    return model

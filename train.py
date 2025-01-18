@@ -22,6 +22,8 @@ sys.path.append(str(wd))
 from sentencepiece import SentencePieceProcessor
 
 from dcformer import DCFormerLlama,ModelArgs 
+from ddformer import DynamicDenseFormer,ModelArgs as ModelArgsDD 
+#from ddformer_stack import DynamicDenseFormer, ModelArgs as ModelArgsDD
 from tp import maybe_init_dist
 
 
@@ -40,23 +42,37 @@ def timed(fn):
     torch.cuda.synchronize()
     return result, start.elapsed_time(end) / 1000
 
-def main(model_size='7B', use_dcmha=False,q_chunk_size=2048, batch_size=1, compile=True, dtype=torch.float16, max_seq_length=2048):
+def main(model_name='DynamicDense', model_size='7B', use_dcmha=False,q_chunk_size=2048, batch_size=1, compile=False, dtype=torch.float16, max_seq_length=2048):
     N_ITERS = 100
     VS = 50257
     device = torch.device('cuda:0')
+    #max_seq_length = 1024
     
     if model_size == '2p8B':
         n_layer,n_head,dim = 32,32,2560
+    elif model_size == '0p2B':
+        n_layer,n_head,dim = 4,16,1024
+    elif model_size == '1p4B':
+        n_layer,n_head,dim = 24,16,2048
     elif model_size == '7B':
         n_layer,n_head,dim = 32,32,4096
-    config = ModelArgs(n_layer=n_layer,n_head=n_head,dim=dim,block_size=max_seq_length, q_chunk_size=q_chunk_size,use_dcmha=use_dcmha,vocab_size=VS, use_gradient_checkpointing=True, is_training=True) # 6.7B
-    print('config', config)
+        n_layer,n_head,dim = 32,32,4096
+    if model_name == 'DynamicDense':
+        # no q_chunk_size and dcmha 
+        #config = ModelArgsDD(n_layer=n_layer,n_head=n_head,dim=dim,block_size=max_seq_length, q_chunk_size=q_chunk_size,use_dcmha=use_dcmha,vocab_size=VS, use_gradient_checkpointing=True, is_training=True, stack_hidden=False,dense=False,dynamic_dense=False,sepln=False) # 6.7B
+        config = ModelArgsDD(n_layer=n_layer,n_head=n_head,dim=dim,block_size=max_seq_length, q_chunk_size=q_chunk_size,use_dcmha=use_dcmha,vocab_size=VS, use_gradient_checkpointing=True, is_training=True, stack_hidden=False) # 6.7B
+        model = DynamicDenseFormer(config)
+    else:
+        config = ModelArgs(n_layer=n_layer,n_head=n_head,dim=dim,block_size=max_seq_length, q_chunk_size=q_chunk_size,use_dcmha=use_dcmha,vocab_size=VS, use_gradient_checkpointing=True, is_training=True) # 6.7B
+        model = DCFormerLlama(config)
 
-    model = DCFormerLlama(config)
+    print('config', config)
+    print('compile', compile)
     model = model.to(device=device, dtype=dtype)
     model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
     if compile:
+        # train_opt = torch.compile(train, mode='max-autotune')
         train_opt = torch.compile(train)
     else:
         train_opt = train
@@ -66,6 +82,7 @@ def main(model_size='7B', use_dcmha=False,q_chunk_size=2048, batch_size=1, compi
     inp = torch.randint(VS, (batch_size,max_seq_length+1)).to(device)
     inp = [inp[:,:-1], inp[:, 1:]]
     for i in range(N_ITERS):
+        print(f"Memory used at {i}: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB, {torch.cuda.memory_allocated() / 1e9:.02f}, {torch.cuda.memory_allocated() / 1e9:.02f}")
         if i == 50:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -89,6 +106,7 @@ if  __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
     parser.add_argument('--model_size', type=str, default="7B", help='Model size: 2p8B, 7B')
+    parser.add_argument('--model_name', type=str, default="DynamicDense", help='Model name: DCFormer or DynamicDense')
     parser.add_argument('--use_dcmha', action='store_true', help='Whether to use dcmha')
     parser.add_argument('--query_chunk_size', type=int, default=2048, help='query chunk size used in attention calculation')
     parser.add_argument('--batch_size', type=int, default=1)
@@ -96,4 +114,4 @@ if  __name__ == '__main__':
 
     args = parser.parse_args()
     print('args', args)
-    main(args.model_size, args.use_dcmha, args.query_chunk_size, args.batch_size, args.compile)
+    main(args.model_name, args.model_size, args.use_dcmha, args.query_chunk_size, args.batch_size, args.compile)
